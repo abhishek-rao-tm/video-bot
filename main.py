@@ -1,122 +1,70 @@
+# main.py  —  Slack bot → Replicate Stable Video Diffusion → S3
 import os, time, logging, requests, boto3
 from flask import Flask, request
 from slack_sdk import WebClient
+import replicate                      # NEW
 
-# ── CONFIG ────────────────────────────────────────────────────────────────
-RUNWAY_KEY  = os.environ["RUNWAY_API_KEY"]
-BUCKET      = os.environ["S3_BUCKET"]
+# ── ENV ───────────────────────────────────────────────────────────────────
+REPL_TOKEN  = os.environ["REPLICATE_API_TOKEN"]   # r8_… key
+S3_BUCKET   = os.environ["S3_BUCKET"]
 AWS_ID      = os.environ["AWS_ID"]
 AWS_SECRET  = os.environ["AWS_KEY"]
 SLACK_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 
-s3     = boto3.client("s3",
-          aws_access_key_id=AWS_ID,
-          aws_secret_access_key=AWS_SECRET,
-          region_name="ap-south-1")
-slack  = WebClient(token=SLACK_TOKEN)
-app    = Flask(__name__)
+# ── CLIENTS ───────────────────────────────────────────────────────────────
+rep = replicate.Client(api_token=REPL_TOKEN)
+s3  = boto3.client("s3",
+        aws_access_key_id=AWS_ID,
+        aws_secret_access_key=AWS_SECRET,
+        region_name="ap-south-1")
+slack = WebClient(token=SLACK_TOKEN)
+app   = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# ── ENDPOINT CANDIDATES ───────────────────────────────────────────────────
-CANDIDATES = [
-    {   # 1️⃣  Stable API (May/Jun 2025 rollout)
-        "url":    "https://api.runwayml.com/v1/videos",
-        "json":   lambda prompt: {
-            "prompt": prompt or "hello",
-            "duration": 10,
-            "model": "gen-2.5-alpha"
-        },
-        "headers": {"Authorization": f"Bearer {RUNWAY_KEY}",
-                    "Content-Type": "application/json"}
-    },
-    {   # 2️⃣  /generations with explicit version header
-        "url":    "https://api.runwayml.com/v1/generations",
-        "json":   lambda prompt: {
-            "prompt": prompt or "hello",
-            "duration": 10,
-            "model": "gen-2.5-alpha"
-        },
-        "headers": {"Authorization": f"Bearer {RUNWAY_KEY}",
-                    "Content-Type": "application/json",
-                    "X-Runway-Version": "2024-11-15"}
-    },
-    {   # 3️⃣  legacy v2
-        "url":    "https://api.runwayml.com/v2/generations",
-        "json":   lambda prompt: {
-            "prompt": prompt or "hello",
-            "duration": 10,
-            "model": "gen-2.5-alpha"
-        },
-        "headers": {"Authorization": f"Bearer {RUNWAY_KEY}",
-                    "Content-Type": "application/json"}
-    },
-    {   # 4️⃣  root
-        "url":    "https://api.runwayml.com/generations",
-        "json":   lambda prompt: {
-            "prompt": prompt or "hello",
-            "duration": 10,
-            "model": "gen-2.5-alpha"
-        },
-        "headers": {"Authorization": f"Bearer {RUNWAY_KEY}",
-                    "Content-Type": "application/json"}
-    },
-]
+MODEL  = "stability-ai/sdxl-video-generator"      # SV-Diff 1.1
+DUR    = 4                                        # seconds
 
-# ── RUNWAY CALL ───────────────────────────────────────────────────────────
-def runway_video(prompt: str):
-    for cfg in CANDIDATES:
-        r = requests.post(cfg["url"], headers=cfg["headers"],
-                          json=cfg["json"](prompt))
-        logging.info("TRY %s -> %s %s", cfg["url"], r.status_code, r.text[:120])
+# ── VIDEO GENERATOR ───────────────────────────────────────────────────────
+def make_video(prompt: str):
+    """Return (mp4_bytes, None) or (None, error_text)."""
+    try:
+        pred = rep.run(
+            MODEL,
+            input={
+                "prompt": prompt or "hello world",
+                "seconds": DUR,
+                "seed": 42
+            }
+        )
+    except replicate.exceptions.ReplicateError as e:
+        return None, f"Replicate error: {e}"
 
-        if r.status_code in (200, 201):
-            data   = r.json()
-            job_id = data.get("id") or data.get("job_id")
-            if not job_id:
-                return None, f"Runway success but no id: {data}"
+    # pred is a list of URLs; pick the first ending with .mp4
+    url = next((u for u in pred if u.endswith(".mp4")), None)
+    if not url:
+        return None, "No video URL returned"
+    video = requests.get(url).content
+    return video, None
 
-            # poll
-            while True:
-                job = requests.get(f'{cfg["url"]}/{job_id}',
-                                   headers=cfg["headers"]).json()
-                state = job.get("status")
-                if state == "succeeded":
-                    vid_url = (job.get("output") or job).get("url")
-                    video   = requests.get(vid_url).content
-                    return video, None
-                if state in {"failed", "cancelled"}:
-                    return None, f"Runway job {state}: {job}"
-                time.sleep(4)
-
-        # If we got "Invalid API Version" keep trying next candidate
-        if "Invalid API Version" not in r.text:
-            # Stop on any *other* error
-            try:
-                msg = r.json().get("message", r.text)
-            except ValueError:
-                msg = r.text
-            return None, f"Runway {r.status_code}: {msg}"
-
-    return None, "Runway rejected every known endpoint/version"
-
-# ── AWS S3 ────────────────────────────────────────────────────────────────
+# ── S3 UPLOAD ─────────────────────────────────────────────────────────────
 def upload(video: bytes) -> str:
     key = f"video-{int(time.time())}.mp4"
-    s3.put_object(Bucket=BUCKET, Key=key, Body=video,
+    s3.put_object(Bucket=S3_BUCKET, Key=key, Body=video,
                   ACL="public-read", ContentType="video/mp4")
-    return f"https://{BUCKET}.s3.ap-south-1.amazonaws.com/{key}"
+    return f"https://{S3_BUCKET}.s3.ap-south-1.amazonaws.com/{key}"
 
 # ── SLACK ROUTE ───────────────────────────────────────────────────────────
 @app.route("/slack/events", methods=["POST"])
-def events():
+def slack_events():
     body = request.json or {}
     if "challenge" in body:
         return body["challenge"]
 
     ev = body.get("event", {})
     if ev.get("type") == "app_mention":
-        text, chan = ev.get("text", ""), ev.get("channel")
-        vid, err   = runway_video(text)
+        txt  = ev.get("text", "")
+        chan = ev.get("channel")
+        vid, err = make_video(txt)
         if err:
             slack.chat_postMessage(channel=chan, text=f"⚠️ {err}")
         else:
@@ -124,7 +72,7 @@ def events():
     return "OK", 200
 
 @app.route("/healthz")
-def health():  return "pong", 200
+def health(): return "pong", 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
