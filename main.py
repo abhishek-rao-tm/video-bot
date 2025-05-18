@@ -1,50 +1,50 @@
 """
-Slack bot → Hugging Face Stable Video Diffusion (open model) → S3 link
+Slack → Hugging Face Stable Video Diffusion (img2vid-xt) → S3
+Shows exact HF errors in Slack and Render logs.
 """
 
 import os, time, logging, boto3, requests
 from flask import Flask, request
 from slack_sdk import WebClient
-from huggingface_hub import InferenceClient   #  ← InferenceError removed
+from huggingface_hub import InferenceClient
 
 # ── ENV ───────────────────────────────────────────────────────────────────
-HF_TOKEN   = os.environ["HF_TOKEN"]
-HF_MODEL   = os.environ.get("HF_MODEL",
-              "cerspencer/stable-video-diffusion-img2vid-xt")
-S3_BUCKET  = os.environ["S3_BUCKET"]
-AWS_ID     = os.environ["AWS_ID"]
-AWS_SECRET = os.environ["AWS_KEY"]
-SLACK_TOK  = os.environ["SLACK_BOT_TOKEN"]
+HF_TOKEN  = os.environ["HF_TOKEN"]                       # hf_xxx
+HF_MODEL  = os.environ.get("HF_MODEL",
+             "stabilityai/stable-video-diffusion-img2vid-xt")
+S3_BUCKET = os.environ["S3_BUCKET"]
+AWS_ID    = os.environ["AWS_ID"]
+AWS_KEY   = os.environ["AWS_KEY"]
+SLACK_TOK = os.environ["SLACK_BOT_TOKEN"]
+
+# ── BANNER so you know THIS build is running ──────────────────────────────
+print("🚀  BOT STARTING — model:", HF_MODEL)
 
 # ── CLIENTS ───────────────────────────────────────────────────────────────
 hf     = InferenceClient(token=HF_TOKEN)
 s3     = boto3.client("s3",
           aws_access_key_id=AWS_ID,
-          aws_secret_access_key=AWS_SECRET,
+          aws_secret_access_key=AWS_KEY,
           region_name="ap-south-1")
 slack  = WebClient(token=SLACK_TOK)
 app    = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
 # ── VIDEO GENERATOR ───────────────────────────────────────────────────────
-# ── VIDEO GENERATOR ───────────────────────────────────────────────────────
-import requests  # add at top if not present
-
 def generate_video(prompt: str):
-    """
-    Return (video_bytes, None)   on success
-           (None, 'HF error: …') on failure with full details.
-    """
+    """Return (bytes, None) or (None, human-readable error)."""
     try:
         mp4 = hf.text_to_video(model=HF_MODEL, prompt=prompt or "hello world")
         return mp4, None
 
     except requests.HTTPError as e:
-        # Extract status code & response text for clarity
-        status = e.response.status_code if e.response else "N/A"
-        text   = e.response.text[:200] if e.response else str(e)
-        logging.error("HF HTTPError %s → %s", status, text)
-        return None, f"HF error {status}: {text}"
+        resp = e.response
+        status = resp.status_code if resp else "N/A"
+        body   = resp.text.strip()[:300] if resp else repr(e)
+        if not body:                       # make sure it's never empty
+            body = "<empty response body>"
+        logging.error("HF HTTPError %s → %s", status, body)
+        return None, f"HF error {status}: {body}"
 
     except Exception as e:
         logging.exception("HF unknown error")
@@ -66,8 +66,10 @@ def slack_events():
 
     ev = body.get("event", {})
     if ev.get("type") == "app_mention":
-        prompt, chan = ev.get("text", ""), ev.get("channel")
-        vid, err     = generate_video(prompt)
+        txt  = ev.get("text", "")
+        chan = ev.get("channel")
+
+        vid, err = generate_video(txt)
         msg = f"⚠️ {err}" if err else upload(vid)
         slack.chat_postMessage(channel=chan, text=msg)
     return "OK", 200
