@@ -41,25 +41,27 @@ def fetch_images(prompt: str, n=IMG_COUNT):
     imgs = []
     for i in range(n):
         url   = pollinations_url(prompt)
-        delay = 2          # initial back-off
-        for attempt in range(1, 4):           # 3 attempts
+        delay = 2
+        for attempt in range(1, 6):          # ← 5 tries instead of 3
             try:
                 r = requests.get(url, timeout=60)
                 r.raise_for_status()
                 img = Image.open(io.BytesIO(r.content)).convert("RGB")
                 img = img.resize((WIDTH, HGT), Image.LANCZOS)
                 imgs.append(img)
-                break                           # success → next frame
+                break
             except Exception as e:
-                logging.warning("Frame %d attempt %d failed: %s", i+1, attempt, e)
-                if attempt == 3:
-                    # duplicate last good frame (or blank if none yet)
-                    fallback = imgs[-1] if imgs else Image.new("RGB", (WIDTH, HGT), "black")
+                logging.warning(
+                    "Frame %d attempt %d failed: %s", i+1, attempt, e)
+                if attempt == 5:
+                    fallback = (imgs[-1] if imgs else
+                                Image.new("RGB", (WIDTH, HGT), "black"))
                     imgs.append(fallback)
                 else:
                     time.sleep(delay)
-                    delay *= 2                  # exponential back-off
+                    delay *= 2
     return imgs
+
 
 import numpy as np   # ← add at the imports
 
@@ -83,11 +85,21 @@ def make_video(prompt: str):
         return f.read()
 
 
-def upload(video_bytes: bytes) -> str:
+def upload(video: bytes) -> str:
     key = f"video-{int(time.time())}.mp4"
-    s3.put_object(Bucket=S3_BUCKET, Key=key, Body=video_bytes,
-                  ACL="public-read", ContentType="video/mp4")
-    return f"https://{S3_BUCKET}.s3.ap-south-1.amazonaws.com/{key}"
+    s3.put_object(
+        Bucket=S3_BUCKET,
+        Key=key,
+        Body=video,
+        ContentType="video/mp4"
+        # ACL parameter removed – bucket doesn’t allow ACLs
+    )
+    # presigned URL stays valid 7 days (default)
+    return s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": S3_BUCKET, "Key": key},
+        ExpiresIn=604800
+    )
 
 # ── SLACK ROUTE ───────────────────────────────────────────────────────────
 @app.route("/slack/events", methods=["POST"])
