@@ -2,102 +2,129 @@ import os, time, logging, requests, boto3
 from flask import Flask, request
 from slack_sdk import WebClient
 
-# ── ENV ───────────────────────────────────────────────────────────────────
-RUNWAY_KEY  = os.getenv("RUNWAY_API_KEY")
-BUCKET      = os.getenv("S3_BUCKET")
-AWS_ID      = os.getenv("AWS_ID")
-AWS_SECRET  = os.getenv("AWS_KEY")
-SLACK_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+# ── CONFIG ────────────────────────────────────────────────────────────────
+RUNWAY_KEY  = os.environ["RUNWAY_API_KEY"]
+BUCKET      = os.environ["S3_BUCKET"]
+AWS_ID      = os.environ["AWS_ID"]
+AWS_SECRET  = os.environ["AWS_KEY"]
+SLACK_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 
-# ── CLIENTS ───────────────────────────────────────────────────────────────
-s3    = boto3.client("s3",
-         aws_access_key_id=AWS_ID,
-         aws_secret_access_key=AWS_SECRET,
-         region_name="ap-south-1")
-slack = WebClient(token=SLACK_TOKEN)
-app   = Flask(__name__)
+s3     = boto3.client("s3",
+          aws_access_key_id=AWS_ID,
+          aws_secret_access_key=AWS_SECRET,
+          region_name="ap-south-1")
+slack  = WebClient(token=SLACK_TOKEN)
+app    = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# ── CONSTANTS ─────────────────────────────────────────────────────────────
-HEADERS = {
-    "Authorization": f"Bearer {RUNWAY_KEY}",
-    "Content-Type":  "application/json"
-}
-ENDPOINTS = [                         # we’ll probe in this order
-    "https://api.runwayml.com/v1/generations",
-    "https://api.runwayml.com/v2/generations",
-    "https://api.runwayml.com/generations"
+# ── ENDPOINT CANDIDATES ───────────────────────────────────────────────────
+CANDIDATES = [
+    {   # 1️⃣  Stable API (May/Jun 2025 rollout)
+        "url":    "https://api.runwayml.com/v1/videos",
+        "json":   lambda prompt: {
+            "prompt": prompt or "hello",
+            "duration": 10,
+            "model": "gen-2.5-alpha"
+        },
+        "headers": {"Authorization": f"Bearer {RUNWAY_KEY}",
+                    "Content-Type": "application/json"}
+    },
+    {   # 2️⃣  /generations with explicit version header
+        "url":    "https://api.runwayml.com/v1/generations",
+        "json":   lambda prompt: {
+            "prompt": prompt or "hello",
+            "duration": 10,
+            "model": "gen-2.5-alpha"
+        },
+        "headers": {"Authorization": f"Bearer {RUNWAY_KEY}",
+                    "Content-Type": "application/json",
+                    "X-Runway-Version": "2024-11-15"}
+    },
+    {   # 3️⃣  legacy v2
+        "url":    "https://api.runwayml.com/v2/generations",
+        "json":   lambda prompt: {
+            "prompt": prompt or "hello",
+            "duration": 10,
+            "model": "gen-2.5-alpha"
+        },
+        "headers": {"Authorization": f"Bearer {RUNWAY_KEY}",
+                    "Content-Type": "application/json"}
+    },
+    {   # 4️⃣  root
+        "url":    "https://api.runwayml.com/generations",
+        "json":   lambda prompt: {
+            "prompt": prompt or "hello",
+            "duration": 10,
+            "model": "gen-2.5-alpha"
+        },
+        "headers": {"Authorization": f"Bearer {RUNWAY_KEY}",
+                    "Content-Type": "application/json"}
+    },
 ]
 
-# ── RUNWAY HELPER ─────────────────────────────────────────────────────────
+# ── RUNWAY CALL ───────────────────────────────────────────────────────────
 def runway_video(prompt: str):
-    payload = {
-        "model":   "gen-2.5-alpha",   # change if you have another model
-        "prompt":  prompt or "hello",
-        "duration": 10
-    }
-
-    # try each endpoint until one accepts the request
-    for base in ENDPOINTS:
-        r = requests.post(base, headers=HEADERS, json=payload)
-        logging.info("RUNWAY ↩ %s (%s) %s",
-                     r.status_code, base, r.text[:200])
+    for cfg in CANDIDATES:
+        r = requests.post(cfg["url"], headers=cfg["headers"],
+                          json=cfg["json"](prompt))
+        logging.info("TRY %s -> %s %s", cfg["url"], r.status_code, r.text[:120])
 
         if r.status_code in (200, 201):
-            job_id = r.json().get("id")
+            data   = r.json()
+            job_id = data.get("id") or data.get("job_id")
             if not job_id:
-                return None, f"Runway gave no id on {base}"
+                return None, f"Runway success but no id: {data}"
+
             # poll
             while True:
-                job = requests.get(f"{base}/{job_id}", headers=HEADERS).json()
+                job = requests.get(f'{cfg["url"]}/{job_id}',
+                                   headers=cfg["headers"]).json()
                 state = job.get("status")
                 if state == "succeeded":
-                    vid = requests.get(job["output"]["url"]).content
-                    return vid, None
+                    vid_url = (job.get("output") or job).get("url")
+                    video   = requests.get(vid_url).content
+                    return video, None
                 if state in {"failed", "cancelled"}:
                     return None, f"Runway job {state}: {job}"
                 time.sleep(4)
 
-        # if 400 Invalid-API-Version keep looping to next base URL
+        # If we got "Invalid API Version" keep trying next candidate
         if "Invalid API Version" not in r.text:
-            # any other 4xx/5xx → bubble up immediately
+            # Stop on any *other* error
             try:
                 msg = r.json().get("message", r.text)
             except ValueError:
                 msg = r.text
             return None, f"Runway {r.status_code}: {msg}"
 
-    return None, "Runway rejected every known endpoint (API version mismatch)"
+    return None, "Runway rejected every known endpoint/version"
 
-# ── S3 HELPER ─────────────────────────────────────────────────────────────
-def upload_to_s3(data: bytes, key: str) -> str:
-    s3.put_object(Bucket=BUCKET, Key=key, Body=data,
+# ── AWS S3 ────────────────────────────────────────────────────────────────
+def upload(video: bytes) -> str:
+    key = f"video-{int(time.time())}.mp4"
+    s3.put_object(Bucket=BUCKET, Key=key, Body=video,
                   ACL="public-read", ContentType="video/mp4")
     return f"https://{BUCKET}.s3.ap-south-1.amazonaws.com/{key}"
 
-# ── FLASK ROUTES ──────────────────────────────────────────────────────────
+# ── SLACK ROUTE ───────────────────────────────────────────────────────────
 @app.route("/slack/events", methods=["POST"])
-def slack_events():
+def events():
     body = request.json or {}
-    if "challenge" in body:                 # Slack handshake
+    if "challenge" in body:
         return body["challenge"]
 
     ev = body.get("event", {})
     if ev.get("type") == "app_mention":
-        txt, chan = ev.get("text", ""), ev.get("channel")
-        vid, err  = runway_video(txt)
+        text, chan = ev.get("text", ""), ev.get("channel")
+        vid, err   = runway_video(text)
         if err:
             slack.chat_postMessage(channel=chan, text=f"⚠️ {err}")
-            return "OK", 200
-        link = upload_to_s3(vid, f"video-{int(time.time())}.mp4")
-        slack.chat_postMessage(channel=chan,
-                               text=f"Here you go! {link}")
+        else:
+            slack.chat_postMessage(channel=chan, text=upload(vid))
     return "OK", 200
 
 @app.route("/healthz")
-def health():
-    return "pong", 200
+def health():  return "pong", 200
 
-# ── ENTRYPOINT ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
