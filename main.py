@@ -22,48 +22,53 @@ slack  = WebClient(token=SLACK_TOKEN)
 app    = Flask(__name__)
 
 # ── HELPERS ───────────────────────────────────────────────────────────────
+import logging
+logging.basicConfig(level=logging.INFO)
+
 def runway_video(prompt: str):
     """
-    Send prompt to Runway, poll until finished.
-    Returns (video_bytes | None, error_message | None)
+    Hit Runway → return (bytes, None) on success
+                → return (None, "human-readable error") on any failure.
     """
     url     = "https://api.runwayml.com/v2/generations"
     headers = {"Authorization": f"Bearer {RUNWAY}",
                "Content-Type":  "application/json"}
     payload = {
-        "model":   "gen-2.5-alpha",      # swap to gen-3-alpha if you’re whitelisted
-        "prompt":  prompt,
+        "model": "gen-2.5-alpha",     # public model
+        "prompt": prompt or "hello",  # fallback if Slack sent only a mention
         "duration": 10
     }
 
     resp = requests.post(url, headers=headers, json=payload)
-    print("RUNWAY_STATUS", resp.status_code)
-    print("RUNWAY_HEADERS", dict(resp.headers))        # NEW
-    print("RUNWAY_BODY", resp.text)                    # NEW — full body
-    print("-" * 60)
 
+    # 100 % guaranteed to hit Render logs
+    logging.info("RUNWAY ↩ %s %s", resp.status_code, resp.text[:500])
 
-    try:
+    # If Runway says “201 Created” or “200 OK” and gives an id → continue
+    if resp.status_code in (200, 201):
         data = resp.json()
-    except ValueError:
-        return None, f"Runway sent a non-JSON response ({resp.status_code})"
+        job_id = data.get("id")
+        if not job_id:
+            return None, f"Runway no-id error: {data}"
+    else:
+        # Any non-200 is an error right away
+        try:
+            err_msg = resp.json().get("message", resp.text)
+        except ValueError:
+            err_msg = resp.text
+        return None, f"Runway {resp.status_code}: {err_msg}"
 
-    job_id = data.get("id")
-    if not job_id:
-        return None, data.get("message", "Runway rejected the request")
-
-    # ── Poll every 4 s until the job is ready ──
+    # ── Poll until finished ──
     while True:
         job = requests.get(f"{url}/{job_id}", headers=headers).json()
         state = job.get("status")
 
         if state == "succeeded":
-            video_url   = job["output"]["url"]
-            video_bytes = requests.get(video_url).content
-            return video_bytes, None
+            vid_url = job["output"]["url"]
+            return requests.get(vid_url).content, None
 
         if state in {"failed", "cancelled"}:
-            return None, f"Runway job failed: {job}"
+            return None, f"Runway job {state}: {job}"
 
         time.sleep(4)
 
