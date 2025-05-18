@@ -1,59 +1,66 @@
 """
-Slack → Hugging Face Stable Video Diffusion (img2vid-xt) → S3
-Shows exact HF errors in Slack and Render logs.
+Slack bot → Pollinations (free image) → MoviePy cross-fade → S3 MP4
+Completely key-free and 100 % free-tier.
 """
 
-import os, time, logging, boto3, requests
+import os, io, time, logging, random
+import requests, boto3
+from PIL import Image
+import moviepy.editor as mpy
 from flask import Flask, request
 from slack_sdk import WebClient
-from huggingface_hub import InferenceClient
 
 # ── ENV ───────────────────────────────────────────────────────────────────
-HF_TOKEN  = os.environ["HF_TOKEN"]                       # hf_xxx
-HF_MODEL  = os.environ.get("HF_MODEL",
-             "stabilityai/stable-video-diffusion-img2vid-xt")
-S3_BUCKET = os.environ["S3_BUCKET"]
-AWS_ID    = os.environ["AWS_ID"]
-AWS_KEY   = os.environ["AWS_KEY"]
-SLACK_TOK = os.environ["SLACK_BOT_TOKEN"]
-
-# ── BANNER so you know THIS build is running ──────────────────────────────
-print("🚀  BOT STARTING — model:", HF_MODEL)
+S3_BUCKET  = os.environ["S3_BUCKET"]
+AWS_ID     = os.environ["AWS_ID"]
+AWS_SECRET = os.environ["AWS_KEY"]
+SLACK_TOK  = os.environ["SLACK_BOT_TOKEN"]
 
 # ── CLIENTS ───────────────────────────────────────────────────────────────
-hf     = InferenceClient(token=HF_TOKEN)
 s3     = boto3.client("s3",
           aws_access_key_id=AWS_ID,
-          aws_secret_access_key=AWS_KEY,
+          aws_secret_access_key=AWS_SECRET,
           region_name="ap-south-1")
 slack  = WebClient(token=SLACK_TOK)
 app    = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# ── VIDEO GENERATOR ───────────────────────────────────────────────────────
-def generate_video(prompt: str):
-    """Return (bytes, None) or (None, human-readable error)."""
-    try:
-        mp4 = hf.text_to_video(model=HF_MODEL, prompt=prompt or "hello world")
-        return mp4, None
+# ── CONSTANTS ─────────────────────────────────────────────────────────────
+IMG_COUNT   = 6           # frames per clip
+SECS_TOTAL  = 3           # total video length
+WIDTH, HGT  = 1024, 576   # 16:9 720 p-ish
 
-    except requests.HTTPError as e:
-        resp = e.response
-        status = resp.status_code if resp else "N/A"
-        body   = resp.text.strip()[:300] if resp else repr(e)
-        if not body:                       # make sure it's never empty
-            body = "<empty response body>"
-        logging.error("HF HTTPError %s → %s", status, body)
-        return None, f"HF error {status}: {body}"
+# ── HELPERS ───────────────────────────────────────────────────────────────
+def pollinations_url(prompt: str) -> str:
+    seed = random.randint(0, 999999)
+    return f"https://image.pollinations.ai/prompt/{prompt}?seed={seed}"
 
-    except Exception as e:
-        logging.exception("HF unknown error")
-        return None, f"HF error: {e or 'unknown'}"
+def fetch_images(prompt: str):
+    urls = [pollinations_url(prompt) for _ in range(IMG_COUNT)]
+    images = []
+    for u in urls:
+        r = requests.get(u, timeout=30)
+        img = Image.open(io.BytesIO(r.content)).convert("RGB")
+        img = img.resize((WIDTH, HGT), Image.LANCZOS)
+        images.append(img)
+    return images
 
-# ── S3 UPLOAD ─────────────────────────────────────────────────────────────
-def upload(video: bytes) -> str:
+def make_video(prompt: str):
+    imgs   = fetch_images(prompt or "abstract colorful shapes")
+    dur    = SECS_TOTAL / len(imgs)
+    clips  = [mpy.ImageClip(img).set_duration(dur) for img in imgs]
+    video  = mpy.concatenate_videoclips(clips, method="compose").crossfadein(dur/2)
+
+    video.write_videofile("/tmp/out.mp4",
+                          fps=24, codec="libx264",
+                          audio=False, preset="ultrafast",
+                          logger=None)
+    with open("/tmp/out.mp4", "rb") as f:
+        return f.read()
+
+def upload(video_bytes: bytes) -> str:
     key = f"video-{int(time.time())}.mp4"
-    s3.put_object(Bucket=S3_BUCKET, Key=key, Body=video,
+    s3.put_object(Bucket=S3_BUCKET, Key=key, Body=video_bytes,
                   ACL="public-read", ContentType="video/mp4")
     return f"https://{S3_BUCKET}.s3.ap-south-1.amazonaws.com/{key}"
 
@@ -66,12 +73,17 @@ def slack_events():
 
     ev = body.get("event", {})
     if ev.get("type") == "app_mention":
-        txt  = ev.get("text", "")
-        chan = ev.get("channel")
+        prompt = ev.get("text", "")
+        chan   = ev.get("channel")
 
-        vid, err = generate_video(txt)
-        msg = f"⚠️ {err}" if err else upload(vid)
-        slack.chat_postMessage(channel=chan, text=msg)
+        try:
+            mp4   = make_video(prompt)
+            link  = upload(mp4)
+            slack.chat_postMessage(channel=chan, text=link)
+        except Exception as e:
+            logging.exception("Generation failed")
+            slack.chat_postMessage(channel=chan, text=f"⚠️ {e}")
+
     return "OK", 200
 
 @app.route("/healthz")
