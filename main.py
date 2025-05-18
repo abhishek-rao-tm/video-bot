@@ -38,7 +38,10 @@ def runway_video(prompt: str):
 
     resp = requests.post(url, headers=headers, json=payload)
     print("RUNWAY_STATUS", resp.status_code)
-    print("RUNWAY_BODY",   resp.text[:300])
+    print("RUNWAY_HEADERS", dict(resp.headers))        # NEW
+    print("RUNWAY_BODY", resp.text)                    # NEW — full body
+    print("-" * 60)
+
 
     try:
         data = resp.json()
