@@ -2,6 +2,7 @@ flask
 slack_sdk
 boto3
 requests
-pillow
-moviepy
-numpy           # ← NEW
+pillow==10.4.0          # latest Pillow that works with moviepy-1.x
+numpy==1.26.4           # moviepy-1.x expects NumPy <2
+moviepy==1.0.3
+imageio-ffmpeg==0.4.9   # bundled ffmpeg binary moviepy needs
