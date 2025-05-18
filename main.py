@@ -61,11 +61,19 @@ def fetch_images(prompt: str, n=IMG_COUNT):
                     delay *= 2                  # exponential back-off
     return imgs
 
+import numpy as np   # ← add at the imports
+
 def make_video(prompt: str):
     imgs   = fetch_images(prompt or "abstract colorful shapes")
     dur    = SECS_TOTAL / len(imgs)
-    clips  = [mpy.ImageClip(img).set_duration(dur) for img in imgs]
-    video  = mpy.concatenate_videoclips(clips, method="compose").crossfadein(dur/2)
+    clips  = []
+
+    for img in imgs:
+        frame = np.array(img)                # ← convert PIL → ndarray
+        clip  = mpy.ImageClip(frame).set_duration(dur)
+        clips.append(clip)
+
+    video = mpy.concatenate_videoclips(clips, method="compose").crossfadein(dur/2)
 
     video.write_videofile("/tmp/out.mp4",
                           fps=24, codec="libx264",
@@ -73,6 +81,7 @@ def make_video(prompt: str):
                           logger=None)
     with open("/tmp/out.mp4", "rb") as f:
         return f.read()
+
 
 def upload(video_bytes: bytes) -> str:
     key = f"video-{int(time.time())}.mp4"
