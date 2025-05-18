@@ -85,21 +85,28 @@ def make_video(prompt: str):
         return f.read()
 
 
-def upload(video: bytes) -> str:
+def upload(video_bytes: bytes) -> str:
+    """
+    Upload MP4 to S3 without ACLs and return a 7-day presigned URL.
+    Works even when the bucket has Object Ownership = BucketOwnerEnforced.
+    """
     key = f"video-{int(time.time())}.mp4"
+
+    # --- NO ACL argument here ---
     s3.put_object(
         Bucket=S3_BUCKET,
         Key=key,
-        Body=video,
+        Body=video_bytes,
         ContentType="video/mp4"
-        # ACL parameter removed – bucket doesn’t allow ACLs
     )
-    # presigned URL stays valid 7 days (default)
+
+    # Generate a presigned GET URL (valid 7 days = 604 800 s)
     return s3.generate_presigned_url(
         "get_object",
         Params={"Bucket": S3_BUCKET, "Key": key},
-        ExpiresIn=604800
+        ExpiresIn=604_800
     )
+
 
 # ── SLACK ROUTE ───────────────────────────────────────────────────────────
 @app.route("/slack/events", methods=["POST"])
