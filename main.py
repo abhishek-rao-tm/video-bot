@@ -27,13 +27,28 @@ app    = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
 # ── VIDEO GENERATOR ───────────────────────────────────────────────────────
+# ── VIDEO GENERATOR ───────────────────────────────────────────────────────
+import requests  # add at top if not present
+
 def generate_video(prompt: str):
-    """Return (video_bytes, None) or (None, error_text)."""
+    """
+    Return (video_bytes, None)   on success
+           (None, 'HF error: …') on failure with full details.
+    """
     try:
         mp4 = hf.text_to_video(model=HF_MODEL, prompt=prompt or "hello world")
         return mp4, None
-    except Exception as e:                          # ← catch generic error
-        return None, f"HF error: {e}"
+
+    except requests.HTTPError as e:
+        # Extract status code & response text for clarity
+        status = e.response.status_code if e.response else "N/A"
+        text   = e.response.text[:200] if e.response else str(e)
+        logging.error("HF HTTPError %s → %s", status, text)
+        return None, f"HF error {status}: {text}"
+
+    except Exception as e:
+        logging.exception("HF unknown error")
+        return None, f"HF error: {e or 'unknown'}"
 
 # ── S3 UPLOAD ─────────────────────────────────────────────────────────────
 def upload(video: bytes) -> str:
