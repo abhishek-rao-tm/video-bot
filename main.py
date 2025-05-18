@@ -1,27 +1,22 @@
 """
-Slack bot → Hugging Face Stable Video Diffusion (img2vid) → S3 link
-Author: ChatGPT – May 2025
+Slack bot → Hugging Face Stable Video Diffusion (open model) → S3 link
 """
 
-import os
-import time
-import logging
-import boto3
-import requests
+import os, time, logging, boto3, requests
 from flask import Flask, request
 from slack_sdk import WebClient
-from huggingface_hub import InferenceClient, InferenceError
+from huggingface_hub import InferenceClient   #  ← InferenceError removed
 
-# ────────────────────────────── ENV ───────────────────────────────────────
-HF_TOKEN   = os.environ["HF_TOKEN"]                      # hf_...
+# ── ENV ───────────────────────────────────────────────────────────────────
+HF_TOKEN   = os.environ["HF_TOKEN"]
 HF_MODEL   = os.environ.get("HF_MODEL",
-               "cerspencer/stable-video-diffusion-img2vid-xt")
+              "cerspencer/stable-video-diffusion-img2vid-xt")
 S3_BUCKET  = os.environ["S3_BUCKET"]
 AWS_ID     = os.environ["AWS_ID"]
 AWS_SECRET = os.environ["AWS_KEY"]
 SLACK_TOK  = os.environ["SLACK_BOT_TOKEN"]
 
-# ─────────────────────────── CLIENTS ──────────────────────────────────────
+# ── CLIENTS ───────────────────────────────────────────────────────────────
 hf     = InferenceClient(token=HF_TOKEN)
 s3     = boto3.client("s3",
           aws_access_key_id=AWS_ID,
@@ -31,54 +26,39 @@ slack  = WebClient(token=SLACK_TOK)
 app    = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# ──────────────────── HUGGING FACE CALL (1 shot) ──────────────────────────
+# ── VIDEO GENERATOR ───────────────────────────────────────────────────────
 def generate_video(prompt: str):
-    """
-    Returns (mp4_bytes, None) on success,
-            (None, error_message) on failure.
-    """
+    """Return (video_bytes, None) or (None, error_text)."""
     try:
-        # This model returns binary MP4 directly
-        mp4_bytes = hf.text_to_video(
-            model   = HF_MODEL,
-            prompt  = prompt or "hello world"
-        )
-        return mp4_bytes, None
-    except InferenceError as e:
+        mp4 = hf.text_to_video(model=HF_MODEL, prompt=prompt or "hello world")
+        return mp4, None
+    except Exception as e:                          # ← catch generic error
         return None, f"HF error: {e}"
 
-# ────────────────────────── S3 UPLOAD ─────────────────────────────────────
-def upload_to_s3(data: bytes) -> str:
+# ── S3 UPLOAD ─────────────────────────────────────────────────────────────
+def upload(video: bytes) -> str:
     key = f"video-{int(time.time())}.mp4"
-    s3.put_object(Bucket=S3_BUCKET, Key=key, Body=data,
+    s3.put_object(Bucket=S3_BUCKET, Key=key, Body=video,
                   ACL="public-read", ContentType="video/mp4")
     return f"https://{S3_BUCKET}.s3.ap-south-1.amazonaws.com/{key}"
 
-# ────────────────────────── SLACK ROUTES ──────────────────────────────────
+# ── SLACK ROUTE ───────────────────────────────────────────────────────────
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
     body = request.json or {}
-    if "challenge" in body:             # Slack URL verification
+    if "challenge" in body:
         return body["challenge"]
 
     ev = body.get("event", {})
     if ev.get("type") == "app_mention":
-        prompt = ev.get("text", "")
-        channel = ev.get("channel")
-
-        video, err = generate_video(prompt)
-        if err:
-            slack.chat_postMessage(channel=channel, text=f"⚠️ {err}")
-        else:
-            link = upload_to_s3(video)
-            slack.chat_postMessage(channel=channel, text=link)
-
+        prompt, chan = ev.get("text", ""), ev.get("channel")
+        vid, err     = generate_video(prompt)
+        msg = f"⚠️ {err}" if err else upload(vid)
+        slack.chat_postMessage(channel=chan, text=msg)
     return "OK", 200
 
 @app.route("/healthz")
-def health():            # for uptime pings
-    return "pong", 200
+def health(): return "pong", 200
 
-# ────────────────────────── ENTRYPOINT ────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
