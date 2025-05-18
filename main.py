@@ -18,18 +18,40 @@ slack = WebClient(token=SLACK_BOT)
 app = Flask(__name__)
 
 def runway_video(prompt):
-    r = requests.post(
-      "https://api.runwayml.com/v2/generations",
-      headers={"Authorization": f"Bearer {RUNWAY}"},
-      json={"model":"gen-3-alpha","prompt":prompt,"duration":10}).json()
-    jid = r["id"]
+    url = "https://api.runwayml.com/v2/generations"
+    headers = {"Authorization": f"Bearer {RUNWAY}",
+               "Content-Type": "application/json"}
+    payload = {
+        # 👇 Swap model if you don’t have Gen-3 access
+        "model": "gen-2.5-alpha",
+        "prompt": prompt,
+        "duration": 10
+    }
+
+    resp = requests.post(url, headers=headers, json=payload)
+
+    # NEW — small log dump so Render logs show the real issue
+    print("RUNWAY_STATUS", resp.status_code)
+    print("RUNWAY_BODY", resp.text[:300])  # first 300 chars
+
+    data = resp.json()
+    if "id" not in data:
+        # Optional: reply gracefully instead of crashing
+        return None, data.get("message", "Runway error")
+
+    jid = data["id"]
+
+    # Poll every 4 s until finished
     while True:
         status = requests.get(
-           f"https://api.runwayml.com/v2/generations/{jid}",
-           headers={"Authorization": f"Bearer {RUNWAY}"}).json()
-        if status["status"] == "succeeded":
-            return requests.get(status["output"]["url"]).content
+            f"{url}/{jid}",
+            headers=headers).json()
+
+        if status.get("status") == "succeeded":
+            video_bytes = requests.get(status["output"]["url"]).content
+            return video_bytes, None
         time.sleep(4)
+
 
 def s3_url(data, name):
     s3.put_object(Bucket=BUCKET, Key=name, Body=data,
@@ -38,15 +60,18 @@ def s3_url(data, name):
 
 @app.route("/slack/events", methods=["POST"])
 def events():
-    body = request.json
-    if "challenge" in body:                # URL verification handshake
-        return body["challenge"]
     if body["event"]["type"] == "app_mention":
-        txt = body["event"]["text"]
-        chan = body["event"]["channel"]
-        vid = runway_video(txt)
-        link = s3_url(vid, f"video-{int(time.time())}.mp4")
-        slack.chat_postMessage(channel=chan, text=f"Here you go! {link}")
+    txt  = body["event"]["text"]
+    chan = body["event"]["channel"]
+
+    vid, err = runway_video(txt)
+    if err:
+        slack.chat_postMessage(channel=chan, text=f"⚠️ {err}")
+        return "OK"
+
+    link = s3_url(vid, f"video-{int(time.time())}.mp4")
+    slack.chat_postMessage(channel=chan, text=f"Here you go! {link}")
+
     return "OK"
 
 @app.route("/healthz")        # keep-alive probe
