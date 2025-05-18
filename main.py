@@ -35,15 +35,31 @@ def pollinations_url(prompt: str) -> str:
     seed = random.randint(0, 999999)
     return f"https://image.pollinations.ai/prompt/{prompt}?seed={seed}"
 
-def fetch_images(prompt: str):
-    urls = [pollinations_url(prompt) for _ in range(IMG_COUNT)]
-    images = []
-    for u in urls:
-        r = requests.get(u, timeout=30)
-        img = Image.open(io.BytesIO(r.content)).convert("RGB")
-        img = img.resize((WIDTH, HGT), Image.LANCZOS)
-        images.append(img)
-    return images
+import time, random
+
+def fetch_images(prompt: str, n=IMG_COUNT):
+    imgs = []
+    for i in range(n):
+        url   = pollinations_url(prompt)
+        delay = 2          # initial back-off
+        for attempt in range(1, 4):           # 3 attempts
+            try:
+                r = requests.get(url, timeout=60)
+                r.raise_for_status()
+                img = Image.open(io.BytesIO(r.content)).convert("RGB")
+                img = img.resize((WIDTH, HGT), Image.LANCZOS)
+                imgs.append(img)
+                break                           # success → next frame
+            except Exception as e:
+                logging.warning("Frame %d attempt %d failed: %s", i+1, attempt, e)
+                if attempt == 3:
+                    # duplicate last good frame (or blank if none yet)
+                    fallback = imgs[-1] if imgs else Image.new("RGB", (WIDTH, HGT), "black")
+                    imgs.append(fallback)
+                else:
+                    time.sleep(delay)
+                    delay *= 2                  # exponential back-off
+    return imgs
 
 def make_video(prompt: str):
     imgs   = fetch_images(prompt or "abstract colorful shapes")
