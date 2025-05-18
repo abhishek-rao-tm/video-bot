@@ -1,28 +1,29 @@
 """
 Slack → Pollinations.ai (free images) → MoviePy cross-fade → S3 MP4
-Works on Render free tier & buckets with ACLs disabled.
+Runs on Render free tier and buckets with Object-Owner–Enforced ACLs.
 """
 
 import os, io, time, random, logging, threading
 import requests, boto3, numpy as np
 from PIL import Image
 import moviepy.editor as mpy
+from moviepy.config import change_settings          # ← fixed import
 import imageio_ffmpeg
 from flask import Flask, request
 from slack_sdk import WebClient
 
-# ── CONFIG ────────────────────────────────────────────────────────────────
+# ── CONFIG ───────────────────────────────────────────────────────────────
 S3_BUCKET   = os.environ["S3_BUCKET"]
 AWS_ID      = os.environ["AWS_ID"]
 AWS_SECRET  = os.environ["AWS_KEY"]
-S3_REGION   = "eu-north-1"          # <---- put your bucket region here
+S3_REGION   = "eu-north-1"          # ← your bucket’s region
 SLACK_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 
 IMG_COUNT  = 6
 SECS_TOTAL = 3
 WIDTH, HGT = 1024, 576
 
-# ── CLIENTS ───────────────────────────────────────────────────────────────
+# ── CLIENTS ──────────────────────────────────────────────────────────────
 s3    = boto3.client("s3",
          aws_access_key_id=AWS_ID,
          aws_secret_access_key=AWS_SECRET,
@@ -31,12 +32,10 @@ slack = WebClient(token=SLACK_TOKEN)
 app   = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# ── Tell MoviePy where ffmpeg lives (wheel-bundled) ───────────────────────
-mpy.config.change_settings(
-    {"FFMPEG_BINARY": imageio_ffmpeg.get_ffmpeg_exe()}
-)
+# ── Point MoviePy to the wheel-bundled ffmpeg ────────────────────────────
+change_settings({"FFMPEG_BINARY": imageio_ffmpeg.get_ffmpeg_exe()})
 
-# ── HELPERS ───────────────────────────────────────────────────────────────
+# ── HELPERS ──────────────────────────────────────────────────────────────
 def pollinations_url(prompt: str) -> str:
     return f"https://image.pollinations.ai/prompt/{prompt}?seed={random.randint(0, 999999)}"
 
@@ -45,7 +44,7 @@ def fetch_images(prompt: str, n=IMG_COUNT):
     for i in range(n):
         url   = pollinations_url(prompt)
         delay = 2
-        for attempt in range(1, 5):        # 4 tries max (keeps total <30 s)
+        for attempt in range(1, 5):              # max 4 tries
             try:
                 r = requests.get(url, timeout=25)
                 r.raise_for_status()
@@ -69,21 +68,27 @@ def make_video(prompt: str) -> bytes:
     clips  = [mpy.ImageClip(np.asarray(img)).set_duration(dur) for img in frames]
     video  = mpy.concatenate_videoclips(clips, method="compose").crossfadein(dur/2)
 
-    out_file = "/tmp/out.mp4"
-    video.write_videofile(out_file, fps=24, codec="libx264",
+    out_path = "/tmp/out.mp4"
+    video.write_videofile(out_path, fps=24, codec="libx264",
                           audio=False, preset="ultrafast", logger=None)
-    with open(out_file, "rb") as f:
+    with open(out_path, "rb") as f:
         return f.read()
 
 def upload(video_bytes: bytes) -> str:
     key = f"video-{int(time.time())}.mp4"
-    s3.put_object(Bucket=S3_BUCKET, Key=key, Body=video_bytes,
-                  ContentType="video/mp4")            # no ACL param
-    return s3.generate_presigned_url("get_object",
-            Params={"Bucket": S3_BUCKET, "Key": key},
-            ExpiresIn=604_800)                        # 7 days
+    s3.put_object(
+        Bucket=S3_BUCKET,
+        Key=key,
+        Body=video_bytes,
+        ContentType="video/mp4"
+    )
+    return s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": S3_BUCKET, "Key": key},
+        ExpiresIn=604_800      # 7 days
+    )
 
-# ── ROUTES ────────────────────────────────────────────────────────────────
+# ── ROUTES ───────────────────────────────────────────────────────────────
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
     body = request.json or {}
@@ -101,7 +106,7 @@ def slack_events():
             try:
                 mp4  = make_video(prompt)
                 link = upload(mp4)
-                logging.info("Generation OK -> %s", link)
+                logging.info("Generation OK ➜ %s", link)
                 slack.chat_postMessage(channel=chan, text=link)
             except Exception as e:
                 logging.exception("Generation failed")
