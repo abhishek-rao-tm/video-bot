@@ -3,4 +3,5 @@ slack_sdk
 boto3
 requests
 pillow
-moviepy
+moviepy==1.0.3
+imageio-ffmpeg==0.4.9   # moviepy needs an ffmpeg binary
