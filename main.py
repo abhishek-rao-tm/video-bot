@@ -1,70 +1,61 @@
-# main.py  —  Slack bot → Replicate Stable Video Diffusion → S3
+# main.py  —  Slack bot ▶ HuggingFace SVD-Img2Vid ▶ S3
 import os, time, logging, requests, boto3
 from flask import Flask, request
 from slack_sdk import WebClient
-import replicate                      # NEW
+from huggingface_hub import InferenceClient, InferenceError
 
 # ── ENV ───────────────────────────────────────────────────────────────────
-REPL_TOKEN  = os.environ["REPLICATE_API_TOKEN"]   # r8_… key
-S3_BUCKET   = os.environ["S3_BUCKET"]
-AWS_ID      = os.environ["AWS_ID"]
-AWS_SECRET  = os.environ["AWS_KEY"]
-SLACK_TOKEN = os.environ["SLACK_BOT_TOKEN"]
+HF_TOKEN   = os.environ["HF_TOKEN"]                       # <-- your hf_ key
+HF_MODEL   = os.environ.get("HF_MODEL",
+              "cerspencer/stable-video-diffusion-img2vid-xt")
+BUCKET     = os.environ["S3_BUCKET"]
+AWS_ID     = os.environ["AWS_ID"]
+AWS_SECRET = os.environ["AWS_KEY"]
+SLACK_TOK  = os.environ["SLACK_BOT_TOKEN"]
 
 # ── CLIENTS ───────────────────────────────────────────────────────────────
-rep = replicate.Client(api_token=REPL_TOKEN)
-s3  = boto3.client("s3",
-        aws_access_key_id=AWS_ID,
-        aws_secret_access_key=AWS_SECRET,
-        region_name="ap-south-1")
-slack = WebClient(token=SLACK_TOKEN)
+hf    = InferenceClient(token=HF_TOKEN)
+s3    = boto3.client("s3",
+         aws_access_key_id=AWS_ID,
+         aws_secret_access_key=AWS_SECRET,
+         region_name="ap-south-1")
+slack = WebClient(token=SLACK_TOK)
 app   = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-MODEL  = "stability-ai/sdxl-video-generator"      # SV-Diff 1.1
-DUR    = 4                                        # seconds
-
 # ── VIDEO GENERATOR ───────────────────────────────────────────────────────
 def make_video(prompt: str):
-    """Return (mp4_bytes, None) or (None, error_text)."""
+    """
+    Uses HuggingFace Inference API to create a ~2-sec 576×1024 MP4.
+    Returns (bytes, None) on success – (None, error_text) on failure.
+    """
     try:
-        pred = rep.run(
-            MODEL,
-            input={
-                "prompt": prompt or "hello world",
-                "seconds": DUR,
-                "seed": 42
-            }
+        vid_bytes = hf.text_to_video(
+            model = HF_MODEL,
+            prompt = prompt or "hello world"
         )
-    except replicate.exceptions.ReplicateError as e:
-        return None, f"Replicate error: {e}"
-
-    # pred is a list of URLs; pick the first ending with .mp4
-    url = next((u for u in pred if u.endswith(".mp4")), None)
-    if not url:
-        return None, "No video URL returned"
-    video = requests.get(url).content
-    return video, None
+        return vid_bytes, None
+    except InferenceError as e:
+        return None, f"HF error: {e}"
 
 # ── S3 UPLOAD ─────────────────────────────────────────────────────────────
 def upload(video: bytes) -> str:
     key = f"video-{int(time.time())}.mp4"
-    s3.put_object(Bucket=S3_BUCKET, Key=key, Body=video,
+    s3.put_object(Bucket=BUCKET, Key=key, Body=video,
                   ACL="public-read", ContentType="video/mp4")
-    return f"https://{S3_BUCKET}.s3.ap-south-1.amazonaws.com/{key}"
+    return f"https://{BUCKET}.s3.ap-south-1.amazonaws.com/{key}"
 
 # ── SLACK ROUTE ───────────────────────────────────────────────────────────
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
     body = request.json or {}
-    if "challenge" in body:
+    if "challenge" in body:                 # Slack URL verification
         return body["challenge"]
 
     ev = body.get("event", {})
     if ev.get("type") == "app_mention":
-        txt  = ev.get("text", "")
-        chan = ev.get("channel")
-        vid, err = make_video(txt)
+        txt, chan = ev.get("text", ""), ev.get("channel")
+        vid, err  = make_video(txt)
         if err:
             slack.chat_postMessage(channel=chan, text=f"⚠️ {err}")
         else:
