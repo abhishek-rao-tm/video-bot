@@ -1,0 +1,4 @@
+flask
+slack_sdk
+boto3
+requests
