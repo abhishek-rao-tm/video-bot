@@ -24,8 +24,13 @@ logging.basicConfig(level=logging.INFO)
 
 # ── RUNWAY HELPER ─────────────────────────────────────────────────────────
 RUNWAY_URL   = "https://api.runwayml.com/v1/generations"    # ← switched to v1
-HEADERS      = {"Authorization": f"Bearer {RUNWAY_KEY}",
-                "Content-Type":  "application/json"}
+HEADERS = {
+    "Authorization": f"Bearer {RUNWAY_KEY}",
+    "Content-Type":  "application/json",
+    "Accept-Version": "v1"          # ← NEW
+}
+
+print("⚙️  CURRENT RUNWAY URL ->", RUNWAY_URL)
 
 def runway_video(prompt: str):
     payload = {
