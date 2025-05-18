@@ -95,10 +95,33 @@ def upload(video_bytes: bytes) -> str:
     )
 
 # ── ROUTES ────────────────────────────────────────────────────────────────
+import threading
+
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
     body = request.json or {}
-    if "challenge" in body:                 # Slack URL verification
+    if "challenge" in body:                      # Slack URL verification
         return body["challenge"]
 
-    ev = body.get("
+    ev = body.get("event", {})
+    if ev.get("type") == "app_mention":
+        raw    = ev.get("text", "")
+        parts  = raw.split(maxsplit=1)
+        prompt = parts[1] if parts and parts[0].startswith("<@") else raw
+        chan   = ev.get("channel")
+
+        # --- run generator in a background thread ---
+        def worker():
+            try:
+                mp4  = make_video(prompt)
+                link = upload(mp4)
+                slack.chat_postMessage(channel=chan, text=link)
+            except Exception as e:
+                logging.exception("Generation failed")
+                slack.chat_postMessage(channel=chan, text=f"⚠️ {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # Instant ack so Slack won't retry
+    return "OK", 200
+
